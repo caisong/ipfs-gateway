@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -9,233 +10,177 @@ import (
 	"syscall"
 	"time"
 
-	"ipfs-gateway/config"
-	"ipfs-gateway/pkg/discovery"
-	"ipfs-gateway/pkg/gateway"
-	"ipfs-gateway/pkg/stream"
-	"ipfs-gateway/pkg/transfer"
+	"github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+
+	"ipfs-gateway/gateway"
+	"ipfs-gateway/pubsub"
+	"ipfs-gateway/service"
+	"ipfs-gateway/stream"
 )
 
 func main() {
-	// 加载配置
-	cfg := config.LoadConfig()
-	cfg.PrintConfig()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	var services []Service
-
-	// 首先启动服务发现模块（所有其他服务都依赖它）
-	log.Println("启动服务发现模块...")
-	discoveryService, err := startDiscoveryService(ctx, cfg)
+	// Create libp2p host
+	host, err := createHost()
 	if err != nil {
-		log.Fatalf("启动服务发现失败: %v", err)
+		log.Fatalf("Failed to create libp2p host: %v", err)
 	}
-	services = append(services, &DiscoveryServiceWrapper{service: discoveryService})
+	defer host.Close()
 
-	// 启动文件传输服务（网关依赖它）
-	var transferService *transfer.Service
-	if cfg.IsTransferEnabled() || cfg.IsGatewayEnabled() {
-		log.Println("启动文件传输服务...")
-		transferService, err = startTransferService(ctx, cfg, discoveryService)
-		if err != nil {
-			log.Fatalf("启动文件传输服务失败: %v", err)
+	log.Printf("Node ID: %s", host.ID())
+	log.Printf("Listening on: %v", host.Addrs())
+
+	// Create DHT
+	kadDHT, err := createDHT(ctx, host)
+	if err != nil {
+		log.Fatalf("Failed to create DHT: %v", err)
+	}
+
+	// Bootstrap DHT
+	if err := kadDHT.Bootstrap(ctx); err != nil {
+		log.Printf("Warning: DHT bootstrap failed: %v", err)
+	}
+
+	// Start services
+	var wg sync.WaitGroup
+
+	// 1. Start Gateway Service (IPFS proxy with file download)
+	gatewayService, err := gateway.NewService(ctx, host, kadDHT, 8080)
+	if err != nil {
+		log.Fatalf("Failed to create gateway service: %v", err)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Println("Starting gateway service...")
+		if err := gatewayService.Start(); err != nil {
+			log.Printf("Gateway service error: %v", err)
 		}
-		services = append(services, &TransferServiceWrapper{service: transferService})
+	}()
+
+	// 2. Start Ping-Pong Service
+	pongService, err := stream.NewPongService(host, kadDHT, 10*time.Second, 5*time.Second)
+	if err != nil {
+		log.Fatalf("Failed to create pong service: %v", err)
 	}
 
-	// 启动流通信服务
-	if cfg.IsStreamEnabled() {
-		log.Println("启动流通信服务...")
-		streamService, err := startStreamService(cfg, discoveryService)
-		if err != nil {
-			log.Fatalf("启动流通信服务失败: %v", err)
+	// Start broadcasting ping-pong service
+	pongService.Broadcast()
+	log.Println("Ping-pong service started and broadcasting")
+
+	// 3. Start Pubsub File Subscription
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Printf("Starting pubsub file subscription on topic: %s", "ipfs-gateway-files")
+		if err := pubsub.SubscribeToFiles(ctx, host, "ipfs-gateway-files", "./downloads"); err != nil {
+			log.Printf("Pubsub subscription error: %v", err)
 		}
-		services = append(services, &StreamServiceWrapper{service: streamService})
-	}
+	}()
 
-	// 启动网关服务（依赖传输服务）
-	if cfg.IsGatewayEnabled() {
-		log.Println("启动网关服务...")
-		gatewayService, err := startGatewayService(cfg, transferService, discoveryService)
-		if err != nil {
-			log.Fatalf("启动网关服务失败: %v", err)
-		}
-		services = append(services, gatewayService)
-	}
+	// 4. Start Gateway Service Provider (DHT advertising)
+	gatewayProvider := service.NewProvider(ctx, host, kadDHT, "ipfs-gateway")
+	gatewayProvider.Broadcast()
+	log.Println("Gateway service provider started and broadcasting")
 
-	if len(services) <= 1 { // 只有discovery服务
-		log.Fatal("没有启动任何业务服务")
-	}
+	log.Println("All services started successfully")
+	log.Println("Gateway available at: http://localhost:8080")
 
-	// 启动周期性服务发现
-	go startPeriodicDiscovery(discoveryService, cfg)
-
-	// 启动所有服务
-	for _, service := range services {
-		wg.Add(1)
-		go func(s Service) {
-			defer wg.Done()
-			if err := s.Start(); err != nil {
-				log.Printf("服务启动错误: %v", err)
-			}
-		}(service)
-	}
-
-	log.Println("所有服务已启动，按 Ctrl+C 退出")
-
-	// 等待中断信号
+	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("正在关闭服务...")
+	log.Println("Shutting down services...")
 	cancel()
 
-	// 停止所有服务（反向顺序）
-	for i := len(services) - 1; i >= 0; i-- {
-		if err := services[i].Stop(); err != nil {
-			log.Printf("停止服务错误: %v", err)
-		}
+	// Stop gateway service
+	if err := gatewayService.Stop(); err != nil {
+		log.Printf("Error stopping gateway service: %v", err)
 	}
 
+	// Wait for all goroutines to finish
 	wg.Wait()
-	log.Println("所有服务已关闭")
+	log.Println("All services stopped")
 }
 
-// Service 服务接口
-type Service interface {
-	Start() error
-	Stop() error
-}
-
-// startDiscoveryService 启动服务发现
-func startDiscoveryService(ctx context.Context, cfg *config.Config) (*discovery.Service, error) {
-	discoveryConfig := discovery.Config{
-		ListenAddress:     cfg.ListenAddress,
-		BootstrapPeers:    cfg.BootstrapPeers,
-		DiscoveryTag:      "ipfs-gateway",
-		AdvertiseInterval: 10 * time.Minute,
+// createHost creates a libp2p host
+func createHost() (host.Host, error) {
+	// Parse listen addresses
+	listenAddr, err := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/4001")
+	if err != nil {
+		return nil, fmt.Errorf("invalid listen address: %w", err)
 	}
 
-	return discovery.NewService(ctx, discoveryConfig)
-}
-
-// startGatewayService 启动网关服务
-func startGatewayService(cfg *config.Config, transferService *transfer.Service, discoveryService *discovery.Service) (Service, error) {
-	gatewayConfig := gateway.Config{
-		RemoteGateway:     cfg.RemoteGateway,
-		Port:              cfg.Port,
-		EnableHealthCheck: cfg.EnableHealthCheck,
-		RequestTimeout:    30 * time.Second,
-		MaxFileSize:       100 * 1024 * 1024, // 100MB
-		EnableCORS:        true,
-		LogRequests:       true,
+	// Create host
+	host, err := libp2p.New(
+		libp2p.ListenAddrs(listenAddr),
+		libp2p.DefaultSecurity,
+		libp2p.DefaultMuxers,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	return gateway.NewService(gatewayConfig, transferService, discoveryService)
+	return host, nil
 }
 
-// startStreamService 启动流通信服务
-func startStreamService(cfg *config.Config, discoveryService *discovery.Service) (*stream.Service, error) {
-	streamConfig := stream.Config{
-		ListenAddress:    cfg.ListenAddress,
-		PingInterval:     time.Duration(cfg.PingInterval) * time.Second,
-		ResponseTimeout:  5 * time.Second,
-		MaxConnections:   100,
-		HeartbeatEnabled: true,
+// createDHT creates and configures a Kademlia DHT
+func createDHT(ctx context.Context, host host.Host) (*dht.IpfsDHT, error) {
+	// Create datastore for DHT
+	ds := dssync.MutexWrap(datastore.NewMapDatastore())
+
+	// Create DHT
+	kadDHT, err := dht.New(ctx, host, dht.Datastore(ds))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create DHT: %w", err)
 	}
 
-	return stream.NewService(streamConfig, discoveryService)
+	// Connect to bootstrap peers (simplified)
+	bootstrapPeers := []string{
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+	}
+
+	var wg sync.WaitGroup
+	for _, peerAddr := range bootstrapPeers {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			if err := connectToPeer(ctx, host, addr); err != nil {
+				log.Printf("Failed to connect to bootstrap peer %s: %v", addr, err)
+			}
+		}(peerAddr)
+	}
+	wg.Wait()
+
+	return kadDHT, nil
 }
 
-// startTransferService 启动文件传输服务
-func startTransferService(ctx context.Context, cfg *config.Config, discoveryService *discovery.Service) (*transfer.Service, error) {
-	transferConfig := transfer.Config{
-		ListenAddress:  cfg.ListenAddress,
-		DatastorePath:  "", // 使用内存存储
-		BitswapWorkers: 8,
-		SessionTimeout: 30 * time.Second,
-		MaxFileSize:    100 * 1024 * 1024, // 100MB
-		DownloadDir:    "./downloads",
+// connectToPeer connects to a peer given its multiaddr
+func connectToPeer(ctx context.Context, host host.Host, peerAddr string) error {
+	addr, err := multiaddr.NewMultiaddr(peerAddr)
+	if err != nil {
+		return fmt.Errorf("invalid peer address: %w", err)
 	}
 
-	return transfer.NewService(ctx, transferConfig, discoveryService)
-}
-
-// startPeriodicDiscovery 启动周期性服务发现
-func startPeriodicDiscovery(discoveryService *discovery.Service, cfg *config.Config) {
-	// 定期发现不同类型的节点
-	if cfg.IsGatewayEnabled() {
-		discoveryService.StartPeriodicDiscovery(discovery.ServiceGateway, 2*time.Minute, 10)
+	peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
+	if err != nil {
+		return fmt.Errorf("failed to get peer info: %w", err)
 	}
-	if cfg.IsStreamEnabled() {
-		discoveryService.StartPeriodicDiscovery(discovery.ServiceStream, 2*time.Minute, 10)
+
+	if err := host.Connect(ctx, *peerInfo); err != nil {
+		return fmt.Errorf("failed to connect to peer: %w", err)
 	}
-	if cfg.IsTransferEnabled() {
-		discoveryService.StartPeriodicDiscovery(discovery.ServiceTransfer, 2*time.Minute, 10)
-	}
-}
 
-// 服务包装器
-
-// DiscoveryServiceWrapper 服务发现包装器
-type DiscoveryServiceWrapper struct {
-	service *discovery.Service
-}
-
-func (w *DiscoveryServiceWrapper) Start() error {
-	// 服务发现在创建时已经启动，这里只需要保持运行
-	log.Printf("服务发现已启动，节点ID: %s", w.service.GetPeerID())
-	log.Printf("监听地址: %v", w.service.GetAddresses())
-
-	// 保持服务运行（使用一个永远阻塞的频道）
-	forever := make(chan struct{})
-	<-forever
+	log.Printf("Connected to bootstrap peer: %s", peerInfo.ID)
 	return nil
-}
-
-func (w *DiscoveryServiceWrapper) Stop() error {
-	return w.service.Stop()
-}
-
-// StreamServiceWrapper 流通信包装器
-type StreamServiceWrapper struct {
-	service *stream.Service
-}
-
-func (w *StreamServiceWrapper) Start() error {
-	// 流通信服务在创建时已经启动，这里只需要保持运行
-	log.Printf("流通信服务已启动")
-
-	// 保持服务运行
-	forever := make(chan struct{})
-	<-forever
-	return nil
-}
-
-func (w *StreamServiceWrapper) Stop() error {
-	return w.service.Stop()
-}
-
-// TransferServiceWrapper 文件传输包装器
-type TransferServiceWrapper struct {
-	service *transfer.Service
-}
-
-func (w *TransferServiceWrapper) Start() error {
-	// 文件传输服务在创建时已经启动，这里只需要保持运行
-	log.Printf("文件传输服务已启动，节点ID: %s", w.service.GetPeerID())
-	log.Printf("下载目录: ./downloads")
-
-	// 保持服务运行
-	forever := make(chan struct{})
-	<-forever
-	return nil
-}
-
-func (w *TransferServiceWrapper) Stop() error {
-	return w.service.Stop()
 }
