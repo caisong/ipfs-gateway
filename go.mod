@@ -6,6 +6,7 @@ toolchain go1.24.4
 
 require (
 	github.com/ipfs/boxo v0.34.0
+	github.com/ipfs/go-block-format v0.2.2
 	github.com/ipfs/go-cid v0.5.0
 	github.com/ipfs/go-datastore v0.8.3
 	github.com/ipfs/go-ipld-format v0.6.2
@@ -14,7 +15,6 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.34.0
 	github.com/libp2p/go-libp2p-pubsub v0.12.0
 	github.com/multiformats/go-multiaddr v0.16.1
-	github.com/stretchr/testify v1.11.1
 )
 
 require (
@@ -25,7 +25,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/crackcomm/go-gitignore v0.0.0-20241020182519-7843d2ba8fdf // indirect
 	github.com/cskr/pubsub v1.0.2 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -47,7 +46,6 @@ require (
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/ipfs/bbloom v0.0.4 // indirect
 	github.com/ipfs/go-bitfield v1.1.0 // indirect
-	github.com/ipfs/go-block-format v0.2.2 // indirect
 	github.com/ipfs/go-ipfs-delay v0.0.1 // indirect
 	github.com/ipfs/go-ipfs-pq v0.0.3 // indirect
 	github.com/ipfs/go-ipfs-redirects-file v0.1.2 // indirect
@@ -117,7 +115,6 @@ require (
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/turn/v4 v4.0.2 // indirect
 	github.com/pion/webrtc/v4 v4.1.2 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/polydawn/refmt v0.89.0 // indirect
 	github.com/prometheus/client_golang v1.23.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -127,6 +124,7 @@ require (
 	github.com/quic-go/quic-go v0.54.0 // indirect
 	github.com/quic-go/webtransport-go v0.9.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/ucarion/urlpath v0.0.0-20200424170820-7ccc79b76bbb // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
@@ -157,6 +155,5 @@ require (
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	gonum.org/v1/gonum v0.16.0 // indirect
 	google.golang.org/protobuf v1.36.7 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )

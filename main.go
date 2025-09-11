@@ -10,6 +10,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ipfs/boxo/bitswap"
+	"github.com/ipfs/boxo/bitswap/network/bsnet"
+	"github.com/ipfs/boxo/blockservice"
+	"github.com/ipfs/boxo/blockstore"
+	"github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
 	"github.com/libp2p/go-libp2p"
@@ -49,11 +54,18 @@ func main() {
 		log.Printf("Warning: DHT bootstrap failed: %v", err)
 	}
 
+	// Create shared IPFS components to avoid duplication
+	sharedComponents, err := createSharedIPFSComponents(ctx, host, kadDHT)
+	if err != nil {
+		log.Fatalf("Failed to create shared IPFS components: %v", err)
+	}
+	log.Println("Shared IPFS components created successfully")
+
 	// Start services
 	var wg sync.WaitGroup
 
-	// 1. Start Gateway Service (IPFS proxy with file download)
-	gatewayService, err := gateway.NewService(ctx, host, kadDHT, 8080)
+	// 1. Start Gateway Service with shared components
+	gatewayService, err := gateway.NewServiceWithComponents(ctx, sharedComponents, 8080)
 	if err != nil {
 		log.Fatalf("Failed to create gateway service: %v", err)
 	}
@@ -67,8 +79,8 @@ func main() {
 		}
 	}()
 
-	// 2. Start Ping-Pong Service
-	pongService, err := stream.NewPongService(host, kadDHT, 10*time.Second, 5*time.Second)
+	// 2. Start Ping-Pong Service with shared components
+	pongService, err := stream.NewPongService(sharedComponents.Host, sharedComponents.DHT, 10*time.Second, 5*time.Second)
 	if err != nil {
 		log.Fatalf("Failed to create pong service: %v", err)
 	}
@@ -77,18 +89,24 @@ func main() {
 	pongService.Broadcast()
 	log.Println("Ping-pong service started and broadcasting")
 
-	// 3. Start Pubsub File Subscription
+	// 3. Start Pubsub File Subscription with shared components
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		log.Printf("Starting pubsub file subscription on topic: %s", "ipfs-gateway-files")
-		if err := pubsub.SubscribeToFiles(ctx, host, "ipfs-gateway-files", "./downloads"); err != nil {
+
+		if err := pubsub.SubscribeToFiles(ctx, sharedComponents, "ipfs-gateway-files", "./downloads"); err != nil {
 			log.Printf("Pubsub subscription error: %v", err)
+		}
+
+		// Subscribe to push messages
+		if err := pubsub.SubscribeToPushMessages(ctx, sharedComponents, nil); err != nil {
+			log.Printf("Push message subscription error: %v", err)
 		}
 	}()
 
-	// 4. Start Gateway Service Provider (DHT advertising)
-	gatewayProvider := service.NewProvider(ctx, host, kadDHT, "ipfs-gateway")
+	// 4. Start Gateway Service Provider (DHT advertising) with shared components
+	gatewayProvider := service.NewProvider(ctx, sharedComponents.Host, sharedComponents.DHT, "ipfs-gateway")
 	gatewayProvider.Broadcast()
 	log.Println("Gateway service provider started and broadcasting")
 
@@ -163,6 +181,27 @@ func createDHT(ctx context.Context, host host.Host) (*dht.IpfsDHT, error) {
 	wg.Wait()
 
 	return kadDHT, nil
+}
+
+// createSharedIPFSComponents creates shared IPFS components to avoid duplication
+func createSharedIPFSComponents(ctx context.Context, host host.Host, kadDHT *dht.IpfsDHT) (*pubsub.IPFSComponents, error) {
+	// Create shared datastore
+	ds := dssync.MutexWrap(datastore.NewMapDatastore())
+	bstore := blockstore.NewBlockstore(ds)
+	bsNet := bsnet.NewFromIpfsHost(host)
+	bs := bitswap.New(ctx, bsNet, kadDHT, bstore)
+	blockService := blockservice.New(bstore, bs)
+	dag := merkledag.NewDAGService(blockService)
+
+	return &pubsub.IPFSComponents{
+		Host:         host,
+		DHT:          kadDHT,
+		Datastore:    ds,
+		Blockstore:   bstore,
+		Bitswap:      bs,
+		BlockService: blockService,
+		DAG:          dag,
+	}, nil
 }
 
 // connectToPeer connects to a peer given its multiaddr
